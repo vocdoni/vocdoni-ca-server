@@ -20,17 +20,30 @@ import (
 	"go.vocdoni.io/dvote/log"
 )
 
+const (
+	kvUserKey   = "u_"
+	kvTokenKey  = "t_"
+	kvSeparator = "_"
+)
+
 func main() {
 	domain := flag.String("domain", "", "domain name for tls")
 	loglevel := flag.String("loglevel", "info", "log level")
 	port := flag.Int("port", 443, "port to listen")
+	eID := flag.String("entityId", "", "entityId")
 	flag.Parse()
 	log.Init(*loglevel, "stdout")
+	if len(*eID) == 0 {
+		log.Fatal("entityId cannot be empty")
+	}
 	var ah authHandler
 	var err error
 	ah.kv, err = db.NewBadgerDB("./db")
 	if err != nil {
 		log.Fatal(err)
+	}
+	if err = ah.generateTokens(*eID, 100); err != nil {
+		log.Fatalf("cannot generate tokens: %v", err)
 	}
 	pxy, err := proxy("0.0.0.0", int32(*port), *domain, "./tls")
 	if err != nil {
@@ -42,6 +55,64 @@ func main() {
 
 type authHandler struct {
 	kv *db.BadgerDB
+}
+
+/*
+ Key Value structure:
+  u_<orgId><user1Hash> = <user1Token>
+  t_<orgId>_<freeToken1> = nil
+  t_<orgId>_<freeToken2> = nil
+  ...
+*/
+
+func (ah *authHandler) generateTokens(orgID string, n int) error {
+	var err error
+	var token uuid.UUID
+	var buf bytes.Buffer
+	for i := 0; i < n; i++ {
+		token = uuid.New()
+		buf.Reset()
+		buf.WriteString(kvTokenKey)
+		buf.WriteString(orgID)
+		buf.WriteString(kvSeparator)
+		buf.WriteString(token.String())
+		if err = ah.kv.Put(buf.Bytes(), []byte{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ah *authHandler) getFreeToken(orgID string) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteString(kvTokenKey)
+	buf.WriteString(orgID)
+	buf.WriteString(kvSeparator)
+
+	iter := ah.kv.NewIterator().(*db.BadgerIterator)
+	token := []byte{}
+	key := []byte{}
+	for iter.Iter.Seek(buf.Bytes()); iter.Iter.ValidForPrefix(buf.Bytes()); iter.Iter.Next() {
+		key = iter.Key()
+		t := key[len(buf.Bytes()):]
+		token = make([]byte, len(t))
+		copy(token, t)
+		break
+	}
+	iter.Release()
+	if len(token) == 0 {
+		return nil, fmt.Errorf("no tokens available")
+	}
+	return token, nil
+}
+
+func (ah *authHandler) delToken(orgID string, token []byte) error {
+	var buf bytes.Buffer
+	buf.WriteString(kvTokenKey)
+	buf.WriteString(orgID)
+	buf.WriteString(kvSeparator)
+	buf.Write(token)
+	return ah.kv.Del(buf.Bytes())
 }
 
 func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +148,7 @@ func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
 		// Compute unique hash and check if already exist
 		ichash := ic.Hash()
 		var dbkey bytes.Buffer
+		dbkey.Write([]byte(kvUserKey))
 		dbkey.Write([]byte(orgID))
 		dbkey.Write(ichash)
 		userToken, err := ah.kv.Get(dbkey.Bytes())
@@ -89,19 +161,28 @@ func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(fmt.Sprintf("<p>already registered, your token is %s</p>", userToken)))
 			return
 		}
-		// Register certificate and give it a token
-		newToken := uuid.New()
+		// Register certificate and give it a new token
+		newToken, err := ah.getFreeToken(orgID)
+		if err != nil {
+			log.Warnf("no tokens available for %s: %v", orgID, err)
+			w.Write([]byte("error: no tokens available for the organization"))
+			return
+		}
+		if err := ah.kv.Put(dbkey.Bytes(), newToken); err != nil {
+			log.Errorf("error storing hash: %v", err)
+			return
+		}
+		if err := ah.delToken(orgID, newToken); err != nil {
+			log.Errorf("cannot delete token: %v", err)
+			return
+		}
 		if _, err := w.Write([]byte(
 			fmt.Sprintf("<p><strong>Registration successful</strong> for %s.<br/>Your token for organization %s is %s</p>",
-				ic.Subject.CommonName, orgID, newToken.String()))); err != nil {
+				ic.Subject.CommonName, orgID, newToken))); err != nil {
 			log.Errorf("error writing: %v", err)
 			return
 		}
-		if err := ah.kv.Put(dbkey.Bytes(), []byte(newToken.String())); err != nil {
-			log.Errorf("<p>error storing hash: %v</p>", err)
-			return
-		}
-		// For console log pretty print
+		// For console log pretty printing
 		content, err = json.Marshal(ic)
 		if err != nil {
 			log.Errorf("json marshal error: %v", err)
