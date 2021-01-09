@@ -32,19 +32,26 @@ func main() {
 	port := flag.Int("port", 443, "port to listen")
 	eID := flag.String("entityId", "", "entityId")
 	flag.Parse()
+
 	log.Init(*loglevel, "stdout")
 	if len(*eID) == 0 {
 		log.Fatal("entityId cannot be empty")
 	}
 	var ah authHandler
 	var err error
+	// Start key value store
 	ah.kv, err = db.NewBadgerDB("./db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err = ah.generateTokens(*eID, 100); err != nil {
-		log.Fatalf("cannot generate tokens: %v", err)
+	// Always have at least 100 tokens available (testing)
+	if ah.countFreeTokens(*eID) < 100 {
+		log.Infof("generating 100 new tokens")
+		if err = ah.generateTokens(*eID, 100); err != nil {
+			log.Fatalf("cannot generate tokens: %v", err)
+		}
 	}
+	// Create the HTTP proxy service with letsencrypt
 	pxy, err := proxy("0.0.0.0", int32(*port), *domain, "./tls")
 	if err != nil {
 		log.Fatal(err)
@@ -113,6 +120,20 @@ func (ah *authHandler) delToken(orgID string, token []byte) error {
 	buf.WriteString(kvSeparator)
 	buf.Write(token)
 	return ah.kv.Del(buf.Bytes())
+}
+
+func (ah *authHandler) countFreeTokens(orgID string) int {
+	var buf bytes.Buffer
+	buf.WriteString(kvTokenKey)
+	buf.WriteString(orgID)
+	buf.WriteString(kvSeparator)
+	iter := ah.kv.NewIterator().(*db.BadgerIterator)
+	count := 0
+	for iter.Iter.Seek(buf.Bytes()); iter.Iter.ValidForPrefix(buf.Bytes()); iter.Iter.Next() {
+		count++
+	}
+	iter.Release()
+	return count
 }
 
 func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
