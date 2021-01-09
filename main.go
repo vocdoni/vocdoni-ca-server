@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -12,6 +13,8 @@ import (
 	"flag"
 
 	"github.com/vocdoni/multirpc/transports/mhttp"
+	"go.vocdoni.io/dvote/crypto/ethereum"
+	"go.vocdoni.io/dvote/db"
 	"go.vocdoni.io/dvote/log"
 )
 
@@ -21,16 +24,27 @@ func main() {
 	port := flag.Int("port", 443, "port to listen")
 	flag.Parse()
 	log.Init(*loglevel, "stdout")
+	var ah authHandler
+	var err error
+	ah.kv, err = db.NewBadgerDB("./db")
+	if err != nil {
+		log.Fatal(err)
+	}
 	pxy, err := proxy("0.0.0.0", int32(*port), *domain, "./tls")
 	if err != nil {
 		log.Fatal(err)
 	}
-	pxy.AddHandler("/", AuthHandler)
+	pxy.AddHandler("/", ah.AuthHandler)
 	select {}
 }
 
-func AuthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+type authHandler struct {
+	kv *db.BadgerDB
+}
+
+func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
+	log.Infof(r.UserAgent())
+	w.Header().Set("Content-Type", "text/html")
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		content, err := json.MarshalIndent(r.TLS.PeerCertificates[0], "", " ")
 		if err != nil {
@@ -38,22 +52,48 @@ func AuthHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ic := new(idCat)
-		json.Unmarshal(content, ic)
+		if err := json.Unmarshal(content, ic); err != nil {
+			log.Debugf("%s", content)
+			log.Errorf("json unmarshal error: %v", err)
+			return
+		}
+		ichash := ic.Hash()
+		exist, err := ah.kv.Has(ichash)
+		if err != nil {
+			log.Errorf("cannot feth db: %v", err)
+			return
+		}
+		if exist {
+			log.Infof("user already registered (hash id: %x", ichash)
+			w.Write([]byte("error: already registered"))
+			return
+		}
+
+		if _, err := w.Write([]byte(fmt.Sprintf("Registration successful for %s, your token %x", ic.Subject.CommonName, ichash))); err != nil {
+			log.Errorf("error writing: %v", err)
+			return
+		}
+		if err := ah.kv.Put(ichash, []byte{}); err != nil {
+			log.Errorf("error storing hash: %v", err)
+			return
+		}
+
 		content, err = json.Marshal(ic)
 		if err != nil {
-			log.Errorf("json error: %v", err)
+			log.Errorf("json marshal error: %v", err)
+			return
 		}
 		fmt.Printf("%s\n", content)
-		w.Write(content)
 	} else {
-		w.Write([]byte("{\"error\":\"no certificates found\"}"))
+		log.Warnf("no certificate found")
+		w.Write([]byte("error: no certificates found"))
 	}
 }
 
 type idCat struct {
 	Issuer struct {
 		Country            []string
-		Organization       string
+		Organization       []string
 		OrganizationalUnit []string
 		Locality           string
 		Province           string
@@ -64,7 +104,7 @@ type idCat struct {
 	}
 	Subject struct {
 		Country            []string
-		Organization       string
+		Organization       []string
 		OrganizationalUnit []string
 		Locality           string
 		Province           string
@@ -75,6 +115,13 @@ type idCat struct {
 	}
 	NotBefore string
 	NotAfter  string
+}
+
+func (ic *idCat) Hash() []byte {
+	b := bytes.Buffer{}
+	b.WriteString(ic.Subject.CommonName)
+	b.WriteString(ic.Subject.SerialNumber)
+	return ethereum.HashRaw(b.Bytes())
 }
 
 func proxy(host string, port int32, tlsDomain, tlsDir string) (*mhttp.Proxy, error) {
