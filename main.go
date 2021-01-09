@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"strings"
 
 	"flag"
 
@@ -34,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	pxy.AddHandler("/", ah.AuthHandler)
+	pxy.AddHandler("/auth/*", ah.AuthHandler)
 	select {}
 }
 
@@ -43,8 +44,13 @@ type authHandler struct {
 }
 
 func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
-	log.Infof(r.UserAgent())
 	w.Header().Set("Content-Type", "text/html")
+	log.Infof(r.UserAgent())
+	orgID := strings.TrimPrefix(r.URL.EscapedPath(), "/auth/")
+	if len(orgID) == 0 {
+		w.Write([]byte("error: no organization provided"))
+		return
+	}
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		content, err := json.MarshalIndent(r.TLS.PeerCertificates[0], "", " ")
 		if err != nil {
@@ -58,22 +64,25 @@ func (ah *authHandler) AuthHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ichash := ic.Hash()
-		exist, err := ah.kv.Has(ichash)
+		var dbkey bytes.Buffer
+		dbkey.Write([]byte(orgID))
+		dbkey.Write(ichash)
+		exist, err := ah.kv.Has(dbkey.Bytes())
 		if err != nil {
 			log.Errorf("cannot feth db: %v", err)
 			return
 		}
 		if exist {
-			log.Infof("user already registered (hash id: %x", ichash)
-			w.Write([]byte("error: already registered"))
+			log.Infof("user already registered on entity %s (hash id: %x", orgID, ichash)
+			w.Write([]byte(fmt.Sprintf("error: already registered, your token is %x", ichash)))
 			return
 		}
 
-		if _, err := w.Write([]byte(fmt.Sprintf("Registration successful for %s, your token %x", ic.Subject.CommonName, ichash))); err != nil {
+		if _, err := w.Write([]byte(fmt.Sprintf("Registration successful for %s, your token for organization %s is %x", ic.Subject.CommonName, orgID, ichash))); err != nil {
 			log.Errorf("error writing: %v", err)
 			return
 		}
-		if err := ah.kv.Put(ichash, []byte{}); err != nil {
+		if err := ah.kv.Put(dbkey.Bytes(), []byte{}); err != nil {
 			log.Errorf("error storing hash: %v", err)
 			return
 		}
