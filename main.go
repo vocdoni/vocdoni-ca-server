@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"flag"
@@ -24,6 +25,7 @@ const (
 	kvUserKey   = "u_"
 	kvTokenKey  = "t_"
 	kvSeparator = "_"
+	ManagerURL  = "https://manager.vocdoni.net/api/token"
 )
 
 func main() {
@@ -31,6 +33,7 @@ func main() {
 	loglevel := flag.String("loglevel", "info", "log level")
 	port := flag.Int("port", 443, "port to listen")
 	eID := flag.String("entityId", "", "entityId")
+	secret := flag.String("secret", "", "Vocdoni manager api secret")
 	flag.Parse()
 
 	log.Init(*loglevel, "stdout")
@@ -45,12 +48,8 @@ func main() {
 		log.Fatal(err)
 	}
 	// Always have at least 100 tokens available (testing)
-	if ah.countFreeTokens(*eID) < 100 {
-		log.Infof("generating 100 new tokens")
-		if err = ah.generateTokens(*eID, 100); err != nil {
-			log.Fatalf("cannot generate tokens: %v", err)
-		}
-	}
+	ah.CountFreeTokens(*eID)
+	go ah.TokenCollector(*eID, *secret, 100)
 	// Create the HTTP proxy service with letsencrypt
 	pxy, err := proxy("0.0.0.0", int32(*port), *domain, "./tls")
 	if err != nil {
@@ -61,7 +60,8 @@ func main() {
 }
 
 type authHandler struct {
-	kv *db.BadgerDB
+	TokenCount int64
+	kv         *db.BadgerDB
 }
 
 /*
@@ -72,21 +72,38 @@ type authHandler struct {
   ...
 */
 
-func (ah *authHandler) generateTokens(orgID string, n int) error {
-	var err error
-	var token uuid.UUID
+func (ah *authHandler) TokenCollector(entityID, secret string, min int64) {
+	for {
+		if v := atomic.LoadInt64(&ah.TokenCount); v < min {
+			log.Infof("fetching new batch of %d tokens", min)
+			if err := ah.generateTokens(entityID, secret, int(min)); err != nil {
+				log.Warn("error fetching tokens: %v", err)
+			}
+		} else {
+			log.Debugf("available tokens %d", v)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func (ah *authHandler) generateTokens(entityID, secret string, n int) error {
+	tokens, err := Generate(ManagerURL, entityID, secret, int(n))
+	if err != nil {
+		return err
+	}
 	var buf bytes.Buffer
-	for i := 0; i < n; i++ {
+	for _, token := range tokens {
 		token = uuid.New()
 		buf.Reset()
 		buf.WriteString(kvTokenKey)
-		buf.WriteString(orgID)
+		buf.WriteString(entityID)
 		buf.WriteString(kvSeparator)
 		buf.WriteString(token.String())
-		if err = ah.kv.Put(buf.Bytes(), []byte{}); err != nil {
+		if err = ah.kv.Put(buf.Bytes(), nil); err != nil {
 			return err
 		}
 	}
+	atomic.AddInt64(&ah.TokenCount, int64(n))
 	return nil
 }
 
@@ -101,9 +118,7 @@ func (ah *authHandler) getFreeToken(orgID string) ([]byte, error) {
 	key := []byte{}
 	for iter.Iter.Seek(buf.Bytes()); iter.Iter.ValidForPrefix(buf.Bytes()); iter.Iter.Next() {
 		key = iter.Key()
-		t := key[len(buf.Bytes()):]
-		token = make([]byte, len(t))
-		copy(token, t)
+		token = key[len(buf.Bytes()):]
 		break
 	}
 	iter.Release()
@@ -119,20 +134,26 @@ func (ah *authHandler) delToken(orgID string, token []byte) error {
 	buf.WriteString(orgID)
 	buf.WriteString(kvSeparator)
 	buf.Write(token)
+	atomic.AddInt64(&ah.TokenCount, -1)
 	return ah.kv.Del(buf.Bytes())
 }
 
-func (ah *authHandler) countFreeTokens(orgID string) int {
+func (ah *authHandler) freeTokens(orgID string) int64 {
+	return atomic.LoadInt64(&ah.TokenCount)
+}
+
+func (ah *authHandler) CountFreeTokens(orgID string) int64 {
 	var buf bytes.Buffer
 	buf.WriteString(kvTokenKey)
 	buf.WriteString(orgID)
 	buf.WriteString(kvSeparator)
 	iter := ah.kv.NewIterator().(*db.BadgerIterator)
-	count := 0
+	count := int64(0)
 	for iter.Iter.Seek(buf.Bytes()); iter.Iter.ValidForPrefix(buf.Bytes()); iter.Iter.Next() {
 		count++
 	}
 	iter.Release()
+	atomic.StoreInt64(&ah.TokenCount, int64(count))
 	return count
 }
 
