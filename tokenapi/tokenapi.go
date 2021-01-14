@@ -1,4 +1,4 @@
-package main
+package tokenapi
 
 import (
 	"bytes"
@@ -20,7 +20,7 @@ import (
 )
 
 // APIConnection holds an API websocket connection
-type APIConnection struct {
+type TokenAPI struct {
 	WS      *websocket.Conn
 	HTTP    *http.Client
 	Address string
@@ -28,18 +28,18 @@ type APIConnection struct {
 
 // NewHTTPapiConnection starts a connection with the given endpoint address. The
 // connection is closed automatically when the test or benchmark finishes.
-func NewHTTPapiConnection(addr string) (*APIConnection, error) {
+func NewHTTPapiConnection(addr string) (*TokenAPI, error) {
 	tr := &http.Transport{
 		MaxIdleConns:       10,
 		IdleConnTimeout:    10 * time.Second,
 		DisableCompression: false,
 	}
-	r := &APIConnection{Address: addr, HTTP: &http.Client{Transport: tr, Timeout: time.Second * 2}}
+	r := &TokenAPI{Address: addr, HTTP: &http.Client{Transport: tr, Timeout: time.Second * 2}}
 	return r, nil
 }
 
 // Request makes a request to the previously connected endpoint
-func (r *APIConnection) Request(req types.MetaRequest, signer *ethereum.SignKeys) (*types.MetaResponse, error) {
+func (r *TokenAPI) Request(req types.MetaRequest, signer *ethereum.SignKeys) (*types.MetaResponse, error) {
 	method := req.Method
 
 	req.Timestamp = int32(time.Now().Unix())
